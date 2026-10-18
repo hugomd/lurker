@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, perf/startup-loading]
   pull_request:
     branches: [main]
 
