@@ -8,7 +8,7 @@
 // longer than a send's 8 s.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { defineComponent, nextTick } from 'vue';
+import { defineComponent, nextTick, watch } from 'vue';
 import { mount } from '@vue/test-utils';
 import { setActivePinia, createPinia } from 'pinia';
 
@@ -27,13 +27,26 @@ class FakeWebSocket {
   constructor() {
     sockets.push(this);
   }
-  addEventListener(type: string, fn: (ev: { data: string }) => void): void {
+  addEventListener(
+    type: string,
+    fn: (ev: { data: string }) => void,
+    options?: { signal?: AbortSignal },
+  ): void {
     const list = this.listeners.get(type) ?? [];
     list.push(fn);
     this.listeners.set(type, list);
+    options?.signal?.addEventListener('abort', () => {
+      this.listeners.set(
+        type,
+        (this.listeners.get(type) ?? []).filter((f) => f !== fn),
+      );
+    });
   }
   removeEventListener(): void {}
-  close(): void {}
+  close(): void {
+    this.readyState = 3;
+    for (const fn of this.listeners.get('close') ?? []) fn({ data: '' });
+  }
   send(raw: string): void {
     this.sent.push(JSON.parse(raw) as Record<string, unknown>);
   }
@@ -49,6 +62,7 @@ import {
   resetSocket,
   socketSendWithAck,
 } from './useSocket.js';
+import { useBuffersStore } from '../stores/buffers.js';
 
 const RouteView = defineComponent({
   setup() {
@@ -78,6 +92,7 @@ describe('socketSendWithAck', () => {
     resetPreviewToggleWiring();
   });
   afterEach(() => {
+    resetSocket();
     vi.useRealTimers();
     vi.unstubAllGlobals();
     resetPreviewToggleWiring();
@@ -166,5 +181,60 @@ describe('socketSendWithAck', () => {
     void socketSendWithAck({ type: 'send' })!.then((r) => (settled = r));
     await vi.advanceTimersByTimeAsync(8_001);
     expect(settled).toEqual({ ok: false, error: 'timeout' });
+  });
+
+  it('hydrates a burst in groups without waiting for its terminator or reordering live news', async () => {
+    vi.useFakeTimers();
+    const ws = await openSocket();
+    const buffers = useBuffersStore();
+    const renderedSizes: number[] = [];
+    const stop = watch(
+      () => buffers.forNetwork(1).length,
+      (size) => renderedSizes.push(size),
+    );
+    for (let i = 0; i < 80; i++) {
+      ws.deliver({
+        kind: 'backlog',
+        networkId: 1,
+        target: `#chan${i}`,
+        events: [],
+        unread: 0,
+        highlights: 0,
+      });
+      // Browser message events have a microtask checkpoint between them.
+      await nextTick();
+    }
+    ws.deliver({
+      kind: 'irc',
+      networkId: 1,
+      target: '#chan0',
+      id: 81,
+      type: 'message',
+      nick: 'alice',
+      text: 'After the backlog',
+    });
+    ws.deliver({ kind: 'read-state', networkId: 1, target: '#chan0', unread: 7, highlights: 2 });
+    await vi.advanceTimersByTimeAsync(1000);
+    stop();
+    expect(buffers.forNetwork(1)).toHaveLength(80);
+    expect(renderedSizes.length).toBeGreaterThan(1);
+    expect(renderedSizes.length).toBeLessThan(10);
+    const buffer = buffers.findByTarget(1, '#chan0')!;
+    expect(buffer.messages.map((m) => m.id)).toEqual([81]);
+    expect(buffer.unread).toBe(7);
+    expect(buffer.highlighted).toBe(2);
+  });
+
+  it.each(['disconnect', 'logout'])('discards unprocessed frames on %s', async (reason) => {
+    vi.useFakeTimers();
+    const ws = await openSocket();
+    ws.deliver({ kind: 'backlog', networkId: 1, target: '#old', events: [] });
+    if (reason === 'logout') resetSocket();
+    else ws.close();
+    const next = await openSocket();
+    next.deliver({ kind: 'backlog', networkId: 1, target: '#new', events: [] });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(useBuffersStore().findByTarget(1, '#old')).toBeFalsy();
+    expect(useBuffersStore().findByTarget(1, '#new')).toBeTruthy();
   });
 });

@@ -808,14 +808,7 @@ function seedInputHistory(payload: any): void {
   useInputHistoryStore().seed(payload.networkId, payload.target, payload.inputHistory, replies);
 }
 
-function handleMessage(raw: string): void {
-  let payload;
-  try {
-    payload = JSON.parse(raw);
-  } catch (_) {
-    return;
-  }
-
+function handleMessage(payload: any): void {
   if (payload.kind === 'snapshot') {
     applySnapshot(payload.networks, payload.globalIgnores || []);
     // Fresh connect ships channel/DM buffers as empty shells (no message rows),
@@ -1163,6 +1156,34 @@ function open() {
   socket = new WebSocket(wsUrl());
   socketListeners = new AbortController();
   const opts = { signal: socketListeners.signal };
+  // A snapshot has one backlog frame per buffer. Applying each in its own
+  // browser task makes Vue re-sort/render the growing sidebar hundreds of times.
+  // Coalesce those frames, but yield between bounded batches so input and paint
+  // still run. Do not wait for backlog-complete: a truncated burst must progress.
+  const pendingFrames: any[] = [];
+  let frameTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearFrames = () => {
+    if (frameTimer !== null) clearTimeout(frameTimer);
+    frameTimer = null;
+    pendingFrames.length = 0;
+  };
+  const flushFrames = () => {
+    frameTimer = null;
+    const deadline = performance.now() + 4;
+    let processed = 0;
+    try {
+      while (processed < pendingFrames.length && processed < 32) {
+        handleMessage(pendingFrames[processed++]);
+        if (opts.signal.aborted || performance.now() >= deadline) break;
+      }
+    } finally {
+      pendingFrames.splice(0, processed);
+      if (pendingFrames.length) frameTimer = setTimeout(flushFrames, 0);
+    }
+  };
+  // Logout aborts listeners before closing; ordinary disconnect uses clearFrames
+  // below. Neither may leave old-account frames queued for a new connection.
+  opts.signal.addEventListener('abort', clearFrames, { once: true });
   socket.addEventListener(
     'open',
     () => {
@@ -1201,13 +1222,27 @@ function open() {
     'message',
     (ev) => {
       lastMessageAt = Date.now();
-      handleMessage(ev.data);
+      let payload;
+      try {
+        payload = JSON.parse(ev.data);
+      } catch (_) {
+        return;
+      }
+      // Keep every later frame behind queued backlogs, including live messages
+      // and read-state updates. Outside a burst, live traffic remains immediate.
+      if (payload.kind === 'backlog' || pendingFrames.length) {
+        pendingFrames.push(payload);
+        if (frameTimer === null) frameTimer = setTimeout(flushFrames, 16);
+      } else {
+        handleMessage(payload);
+      }
     },
     opts,
   );
   socket.addEventListener(
     'close',
     (ev) => {
+      clearFrames();
       connected.value = false;
       socket = null;
       // A probe armed against the socket that just died must not survive into

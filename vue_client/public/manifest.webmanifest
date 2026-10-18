@@ -9,12 +9,6 @@
   "theme_color": "#0b0b0b",
   "icons": [
     {
-      "src": "/lurker-icon.svg",
-      "sizes": "any",
-      "type": "image/svg+xml",
-      "purpose": "any"
-    },
-    {
       "src": "/lurker-icon-192.png",
       "sizes": "192x192",
       "type": "image/png",
