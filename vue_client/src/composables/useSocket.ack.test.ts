@@ -24,7 +24,7 @@ class FakeWebSocket {
   readyState = 0;
   sent: Record<string, unknown>[] = [];
   listeners = new Map<string, Array<(ev: { data: string }) => void>>();
-  constructor() {
+  constructor(readonly url: string) {
     sockets.push(this);
   }
   addEventListener(
@@ -224,6 +224,80 @@ describe('socketSendWithAck', () => {
     expect(buffer.unread).toBe(7);
     expect(buffer.highlighted).toBe(2);
   });
+
+  it.each(['not received', 'queued'])(
+    'replays an incomplete snapshot when its tail was %s',
+    async (tail) => {
+      vi.useFakeTimers();
+      const initial = await openSocket();
+      initial.deliver({ kind: 'snapshot', networks: [], cursor: 100 });
+      initial.close();
+      const ws = await openSocket();
+      expect(new URL(ws.url).searchParams.get('since')).toBe('100');
+      ws.deliver({ kind: 'snapshot', networks: [] });
+      const backlog = (target: string, id: number) => ({
+        kind: 'backlog',
+        networkId: 1,
+        target,
+        events: [{ id, type: 'message', nick: 'alice', text: `Message ${id}` }],
+      });
+      ws.deliver(backlog('#a', 200));
+      if (tail === 'queued') {
+        for (let i = 0; i < 32; i++) {
+          ws.deliver({ kind: 'backlog', networkId: 1, target: `#empty${i}`, events: [] });
+        }
+        ws.deliver(backlog('#b', 150));
+        ws.deliver({ kind: 'backlog-complete' });
+      }
+      await vi.advanceTimersByTimeAsync(16);
+      expect(
+        useBuffersStore()
+          .findByTarget(1, '#a')
+          ?.messages.map((m) => m.id),
+      ).toEqual([200]);
+      expect(useBuffersStore().findByTarget(1, '#b')).toBeFalsy();
+      ws.close();
+      const resumed = await openSocket();
+      expect(new URL(resumed.url).searchParams.get('since')).toBe('100');
+      resumed.deliver({ kind: 'snapshot', networks: [] });
+      resumed.deliver(backlog('#a', 200));
+      resumed.deliver(backlog('#b', 150));
+      resumed.deliver({ kind: 'backlog-complete' });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(
+        useBuffersStore()
+          .findByTarget(1, '#a')
+          ?.messages.map((m) => m.id),
+      ).toEqual([200]);
+      expect(
+        useBuffersStore()
+          .findByTarget(1, '#b')
+          ?.messages.map((m) => m.id),
+      ).toEqual([150]);
+      resumed.close();
+      const live = await openSocket();
+      expect(new URL(live.url).searchParams.get('since')).toBe('200');
+      live.deliver({ kind: 'snapshot', networks: [] });
+      live.deliver({ kind: 'backlog-complete' });
+      live.deliver({
+        kind: 'irc',
+        networkId: 1,
+        target: '#a',
+        id: 250,
+        type: 'message',
+        nick: 'alice',
+        text: 'Live',
+      });
+      // In-band snapshots need the same checkpoint protection as reconnects.
+      live.deliver({ kind: 'snapshot', networks: [] });
+      live.deliver(backlog('#a', 300));
+      await vi.advanceTimersByTimeAsync(100);
+      live.close();
+      expect(new URL((await openSocket()).url).searchParams.get('since')).toBe('250');
+      resetSocket();
+      expect(new URL((await openSocket()).url).searchParams.has('since')).toBe(false);
+    },
+  );
 
   it.each(['disconnect', 'logout'])('discards unprocessed frames on %s', async (reason) => {
     vi.useFakeTimers();

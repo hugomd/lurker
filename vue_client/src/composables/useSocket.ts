@@ -146,11 +146,11 @@ const openHandlers = new Set<() => void>();
 // timeout — whichever fires first.
 const pendingAcks = new Map<string, AckResolver>();
 const ACK_TIMEOUT_MS = 8000;
-// Highest event id this client has ever received in any buffer
-// (lib/seenEventCursor.ts). Sent on reconnect as `?since=N` so the server can
-// ship just the gap instead of re-issuing the whole last-50-per-buffer backlog.
-// Per-buffer dedupe in buffers.pushLive handles any residual overlap if the gap
-// is empty.
+// Unlike seenEventCursor (the highest observed id), this checkpoint advances
+// only after a whole snapshot is consumed: backlogs arrive grouped by buffer,
+// not globally ordered by id. Replaying an interrupted snapshot is deduped by
+// the buffers store.
+let resumeCursor = 0;
 
 // Live IRC events, for a view that has to see its channel's rows even when the
 // buffer's own list won't take them: a detached buffer drops live rows (the
@@ -221,7 +221,7 @@ function armLivenessProbe(): void {
 function wsUrl(): string {
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
   const base = `${proto}://${window.location.host}/ws`;
-  const since = seenEventCursor();
+  const since = resumeCursor;
   return since > 0 ? `${base}?since=${since}` : base;
 }
 
@@ -1156,6 +1156,26 @@ function open() {
   socket = new WebSocket(wsUrl());
   socketListeners = new AbortController();
   const opts = { signal: socketListeners.signal };
+  let snapshotPending = true;
+  let consumptionFailed = false;
+  const consumeFrame = (payload: any) => {
+    if (payload.kind === 'snapshot') snapshotPending = true;
+    try {
+      handleMessage(payload);
+    } catch (error) {
+      // A later terminator cannot certify a frame whose handler failed.
+      consumptionFailed = true;
+      throw error;
+    }
+    if (opts.signal.aborted || consumptionFailed) return;
+    // Fresh connects intentionally omit historical rows. Their server-issued
+    // baseline is safe even if shell hydration is interrupted.
+    if (payload.kind === 'snapshot' && typeof payload.cursor === 'number') {
+      resumeCursor = Math.max(resumeCursor, payload.cursor);
+    }
+    if (payload.kind === 'backlog-complete') snapshotPending = false;
+    if (!snapshotPending) resumeCursor = seenEventCursor();
+  };
   // A snapshot has one backlog frame per buffer. Applying each in its own
   // browser task makes Vue re-sort/render the growing sidebar hundreds of times.
   // Coalesce those frames, but yield between bounded batches so input and paint
@@ -1173,7 +1193,7 @@ function open() {
     let processed = 0;
     try {
       while (processed < pendingFrames.length && processed < 32) {
-        handleMessage(pendingFrames[processed++]);
+        consumeFrame(pendingFrames[processed++]);
         if (opts.signal.aborted || performance.now() >= deadline) break;
       }
     } finally {
@@ -1234,7 +1254,7 @@ function open() {
         pendingFrames.push(payload);
         if (frameTimer === null) frameTimer = setTimeout(flushFrames, 16);
       } else {
-        handleMessage(payload);
+        consumeFrame(payload);
       }
     },
     opts,
@@ -1405,6 +1425,7 @@ export function resetSocket(): void {
   socketOpenedAt = null;
   hiddenSince = null;
   setSeenEventCursor(0);
+  resumeCursor = 0;
   failAllPendingAcks('disconnected');
 }
 
